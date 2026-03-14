@@ -157,6 +157,9 @@ if json_data is not None:
                     # 获取预测的中文标签
                     predicted_label = label_mapper.get_label(predicted_class)
 
+                    # 显示预测结果弹窗
+                    st.success(f"🎵 预测音乐风格：**{predicted_label}**")
+
                     # 显示各流派的预测概率
                     display_genre_probabilities(probabilities)
 

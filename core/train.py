@@ -13,9 +13,9 @@ from data_process import audio_to_cnn_data  # 导入数据处理函数
 # 超参数配置
 hyperparameters = {
     "folder_path": './datasets/music',  # 请替换为实际的音频文件夹路径
-    "batch_size": 32,
+    "batch_size": 16,
     "learning_rate": 4e-4,
-    "num_epochs": 100,
+    "num_epochs": 50,
     "train_ratio": 0.8,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "weight_decay": 1e-4,  # 优化器的权重衰减
