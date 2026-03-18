@@ -12,7 +12,7 @@ from data_process import audio_to_cnn_data  # 导入数据处理函数
 
 # 超参数配置
 hyperparameters = {
-    "folder_path": './datasets/music',  # 请替换为实际的音频文件夹路径
+    "folder_path": "D:/music_classify_project/dataset_multy2_processed/audio",  # 请替换为实际的音频文件夹路径
     "batch_size": 16,
     "learning_rate": 4e-4,
     "num_epochs": 50,

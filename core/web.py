@@ -21,8 +21,342 @@ label_mapper = GTZANLabelMapper()
 
 app = Flask(__name__)
 CORS(app)
+#网页前端  html  ########
+@app.route('/')
+def index():
+    return """
+<!DOCTYPE html>
+<html>
 
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:Ww778899654321,./@127.0.0.1:3306/music_classify'
+<head>
+
+<meta charset="UTF-8">
+
+<title>AI音乐风格分类系统</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+
+body{
+font-family:Arial;
+text-align:center;
+background:#f5f5f5;
+}
+
+.container{
+display:flex;
+justify-content:space-around;
+margin-top:30px;
+}
+
+.card{
+background:white;
+padding:20px;
+border-radius:10px;
+box-shadow:0 0 10px rgba(0,0,0,0.1);
+width:30%;
+}
+
+button{
+padding:10px;
+margin-top:10px;
+cursor:pointer;
+}
+
+.musicCard{
+background:white;
+margin:10px;
+padding:10px;
+border-radius:10px;
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+<h1>🎵 AI音乐风格分类系统</h1>
+
+
+<div class="container">
+
+<div class="card">
+
+<h2>上传音乐</h2>
+
+<input type="text" id="songName" placeholder="歌曲名"><br>
+
+<input type="text" id="singerName" placeholder="歌手"><br>
+
+<input type="file" id="musicFile"><br>
+
+<button onclick="uploadMusic()">上传并分类</button>
+
+</div>
+
+
+<div class="card">
+
+<h2>音乐播放器</h2>
+
+<audio id="audioPlayer" controls></audio>
+
+</div>
+
+
+<div class="card">
+
+<h2>分类结果</h2>
+
+<p id="genreResult">等待预测</p>
+
+<canvas id="probChart"></canvas>
+
+</div>
+
+</div>
+
+<hr>
+
+<h2>搜索音乐</h2>
+
+<input type="text" id="searchInput">
+
+<button onclick="searchMusic()">搜索</button>
+
+<div id="musicList"></div>
+
+
+<script>
+
+let chart=null
+
+
+async function uploadMusic(){
+
+let file=document.getElementById("musicFile").files[0]
+
+if(!file){
+
+alert("请上传音乐")
+
+return
+
+}
+
+let reader=new FileReader()
+
+reader.onload=async function(){
+
+let base64=reader.result
+
+document.getElementById("audioPlayer").src=base64
+
+let data={
+
+songName:document.getElementById("songName").value,
+
+singerName:document.getElementById("singerName").value,
+
+musicFile:base64,
+
+userId:1
+
+}
+
+let res=await fetch("/upload_music",{
+
+method:"POST",
+
+headers:{
+
+"Content-Type":"application/json"
+
+},
+
+body:JSON.stringify(data)
+
+})
+
+let result=await res.json()
+
+document.getElementById("genreResult").innerText =
+"该音乐风格为：" + result["genre"]
+showProb(result["probabilities"])
+}
+
+reader.readAsDataURL(file)
+
+}
+
+
+
+async function searchMusic(){
+
+let query=document.getElementById("searchInput").value
+
+let res=await fetch(`/search_music?query=${query}`)
+
+let data=await res.json()
+
+let list=document.getElementById("musicList")
+
+list.innerHTML=""
+
+data.forEach(m=>{
+
+let div=document.createElement("div")
+
+div.className="musicCard"
+
+div.innerHTML=
+
+`<h3>${m.song_name}</h3>
+
+<p>歌手: ${m.singer_name}</p>
+
+<p>风格: ${m.genre}</p>
+
+<button onclick="playMusic(${m.id})">播放</button>
+
+<button onclick="favorite(${m.id})">收藏</button>
+
+<button onclick='showProb(${JSON.stringify(m.genreProbabilities)})'>概率</button>`
+
+list.appendChild(div)
+
+})
+
+}
+
+
+
+async function playMusic(id){
+
+let res=await fetch(`/get_music_audio?id=${id}`)
+
+let data=await res.json()
+
+document.getElementById("audioPlayer").src="data:audio/mp3;base64,"+data.music_file
+
+}
+
+
+
+async function favorite(id){
+
+await fetch("/toggle_favorite",{
+
+method:"POST",
+
+headers:{
+
+"Content-Type":"application/json"
+
+},
+
+body:JSON.stringify({
+
+user_id:1,
+
+music_id:id
+
+})
+
+})
+
+alert("收藏成功")
+
+}
+
+
+
+function showProb(prob){
+
+let labels=[
+
+"blues",
+
+"classical",
+
+"country",
+
+"disco",
+
+"hiphop",
+
+"jazz",
+
+"metal",
+
+"pop",
+
+"reggae",
+
+"rock"
+
+]
+
+let values=Object.values(prob)
+
+let ctx=document.getElementById("probChart").getContext("2d")
+
+if(chart){
+
+chart.destroy()
+
+}
+
+chart=new Chart(ctx,{
+
+type:"bar",
+
+data:{
+
+labels:labels,
+
+datasets:[{
+
+label:"概率",
+
+data:values,
+
+backgroundColor:"rgba(54,162,235,0.6)"
+
+}]
+
+},
+
+options:{
+
+scales:{
+
+y:{
+
+beginAtZero:true
+
+}
+
+}
+
+}
+
+})
+
+}
+
+</script>
+
+</body>
+
+</html>
+"""
+
+########################
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:Wuyipeng427@127.0.0.1:3306/music_classify'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
@@ -152,6 +486,8 @@ def upload_music():
         else:
             predicted_label = '未知'
 
+        print("预测类别:", predicted_label)
+
         cover_base64 = generate_random_image()
 
         # 创建新音乐记录并关联用户ID
@@ -177,7 +513,22 @@ def upload_music():
         db.session.add(new_music)
         db.session.commit()
 
-        return jsonify({'message': '音乐上传成功'})
+        return jsonify({
+            'message': '音乐上传成功',
+            'genre': predicted_label,
+            'probabilities': {
+                'blues': float(probabilities[0]),
+                'classical': float(probabilities[1]),
+                'country': float(probabilities[2]),
+                'disco': float(probabilities[3]),
+                'hiphop': float(probabilities[4]),
+                'jazz': float(probabilities[5]),
+                'metal': float(probabilities[6]),
+                'pop': float(probabilities[7]),
+                'reggae': float(probabilities[8]),
+                'rock': float(probabilities[9])
+            }
+        })
     except Exception as e:
         return jsonify({'message': f'上传失败: {str(e)}'}), 500
 

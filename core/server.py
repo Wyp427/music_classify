@@ -19,7 +19,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 加载模型
 model = AudioCNN()  # 确保使用与你训练时相同的模型结构
-model.load_state_dict(torch.load('best_model.pth', map_location=device))
+model.load_state_dict(torch.load('best_model_test.pth', map_location=device))
 model.to(device)  # 将模型移动到相应的设备上
 model.eval()  # 切换到评估模式
 
