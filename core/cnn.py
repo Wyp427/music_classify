@@ -2,6 +2,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+"""
+本文件定义音频分类使用的卷积神经网络模型（AudioCNN）。
+
+主要改动是引入 input_channels 参数，使模型能够动态适配不同类型的音频特征输入，
+不再固定为传统 MFCC 的 13 维输入，从而支持 Mel（128维）以及 MFCC+Mel（141维）等多种特征形式。
+
+第一层卷积根据 input_channels 自动构建，保证输入特征维度与网络结构一致，
+避免特征切换时出现维度不匹配问题。
+
+除输入层外，模型保留原有结构设计，包括卷积模块、Mish 激活函数、
+SE 注意力机制、残差结构、全局平均池化、Dropout 以及全连接分类层。
+
+该设计保证在不同特征实验中仅改变输入形式，而保持网络结构一致，
+从而使实验对比更加公平和可控。
+"""
+
 
 # Mish 激活函数定义
 class Mish(nn.Module):
@@ -52,28 +68,28 @@ class ResidualBlock(nn.Module):
             )
 
     def forward(self, x):
-        out = Mish()(self.bn1(self.conv1(x)))  # 使用 Mish 激活函数
+        out = Mish()(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out = self.se(out)
         out += self.shortcut(x)
-        out = Mish()(out)  # 使用 Mish 激活函数
+        out = Mish()(out)
         return out
 
 
-# 修改后的 AudioCNN 模型
 class AudioCNN(nn.Module):
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes=10, input_channels=13):
         super(AudioCNN, self).__init__()
-        self.in_channels = 64  # 初始通道数
-        self.conv1 = nn.Conv2d(13, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.in_channels = 64
+        self.input_channels = input_channels
+        self.conv1 = nn.Conv2d(input_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
-        self.layer1 = self._make_layer(64, 4, stride=1, groups=1)  # 增加残差块数量
-        self.layer2 = self._make_layer(128, 4, stride=2, groups=2)  # 增加残差块数量，使用分组卷积
-        self.layer3 = self._make_layer(256, 4, stride=2, groups=4)  # 增加残差块数量，使用分组卷积
-        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))  # 全局平均池化
-        self.fc1 = nn.Linear(256, 256)  # 增加全连接层神经元数量
+        self.layer1 = self._make_layer(64, 4, stride=1, groups=1)
+        self.layer2 = self._make_layer(128, 4, stride=2, groups=2)
+        self.layer3 = self._make_layer(256, 4, stride=2, groups=4)
+        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc1 = nn.Linear(256, 256)
         self.bn_fc1 = nn.BatchNorm1d(256)
-        self.dropout1 = nn.Dropout(0.3)  # Dropout 概率
+        self.dropout1 = nn.Dropout(0.3)
         self.fc2 = nn.Linear(256, 128)
         self.bn_fc2 = nn.BatchNorm1d(128)
         self.dropout2 = nn.Dropout(0.3)
@@ -88,13 +104,13 @@ class AudioCNN(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = Mish()(self.bn1(self.conv1(x)))  # 使用 Mish 激活函数
+        out = Mish()(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.global_avg_pool(out)
         out = torch.flatten(out, 1)
-        out = Mish()(self.bn_fc1(self.fc1(out)))  # 使用 Mish 激活函数
+        out = Mish()(self.bn_fc1(self.fc1(out)))
         out = self.dropout1(out)
         out = Mish()(self.bn_fc2(self.fc2(out)))
         out = self.dropout2(out)

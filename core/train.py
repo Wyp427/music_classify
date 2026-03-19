@@ -1,32 +1,66 @@
+import json
+import os
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader, random_split
 from torch.optim.lr_scheduler import StepLR
-from cnn import AudioCNN  # 假设 AudioCNN 已经定义在 cnn.py
-import numpy as np
-import os
+from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
-import json
-from data_process import audio_to_cnn_data  # 导入数据处理函数
+
+from cnn import AudioCNN
+from data_process import audio_to_cnn_data
+from feature_utils import get_input_channels, save_feature_config
+
+"""
+本文件负责模型训练流程的完整实现，并支持多种音频特征的对比实验。
+
+在超参数配置中新增 feature_type、n_mfcc、n_mels、max_length 等参数，
+使得仅通过修改配置即可切换不同特征类型，实现高效实验管理。
+
+训练数据通过 audio_to_cnn_data 动态构建，并根据特征类型生成独立缓存文件，
+避免不同实验之间的数据污染。
+
+模型构建阶段通过 get_input_channels 自动获取输入通道数，
+确保网络结构与特征维度一致。
+
+新增 compute_macro_recall 函数，用于计算宏平均召回率，
+并在验证阶段统计整体 Recall，以补充仅使用 Accuracy 的不足。
+
+训练日志中记录 feature_type、验证准确率与召回率，
+便于后续实验对比与分析。
+
+当模型性能提升时，除保存权重外，还保存 best_model_config.json，
+记录完整特征配置（特征类型、采样率、维度参数等），
+用于后续测试和部署阶段自动加载。
+
+此外，为每种特征实验单独保存指标文件 experiment_metrics_<feature_type>.json，
+便于快速构建实验对比结果表。
+"""
+
 
 # 超参数配置
 hyperparameters = {
-    "folder_path": "D:/music_classify_project/dataset_multy2_processed/audio",  # 请替换为实际的音频文件夹路径
+    "folder_path": "D:/music_classify_project/dataset_multy2_processed/audio",
+    "feature_type": "mfcc_mel",  # 可选: mfcc / mel / mfcc_mel
+    "n_mfcc": 13,
+    "n_mels": 128,
+    "max_length": 1000,
     "batch_size": 16,
     "learning_rate": 4e-4,
     "num_epochs": 50,
     "train_ratio": 0.8,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "weight_decay": 1e-4,  # 优化器的权重衰减
-    "step_size": 20,  # 学习率调度器的步长
-    "gamma": 0.678,  # 学习率调度器的衰减因子
-    "optimizer": "Adam",  # 可选值: "Adam", "SGD", "Adagrad"
-    "momentum": 0.937,  # SGD 优化器的动量
-    "nesterov": True,  # SGD 优化器是否使用 Nesterov 动量
-    "eps": 1e-8,  # Adagrad 优化器的小常数，避免除零
-    "lr_decay": 0.0,  # Adagrad 优化器的学习率衰减
-    "random_seed": 42  # 添加随机种子
+    "weight_decay": 1e-4,
+    "step_size": 20,
+    "gamma": 0.678,
+    "optimizer": "Adam",
+    "momentum": 0.937,
+    "nesterov": True,
+    "eps": 1e-8,
+    "lr_decay": 0.0,
+    "random_seed": 42,
 }
 
 # 设置随机种子
@@ -39,22 +73,27 @@ np.random.seed(hyperparameters["random_seed"])
 device = torch.device(hyperparameters["device"])
 print(f"使用设备: {device}")
 
-# 数据缓存文件路径
-cache_file = "processed_data_cache.npz"
-
-# 加载数据
+feature_type = hyperparameters["feature_type"]
+cache_file = f"processed_data_cache_{feature_type}.npz"
+print(f"当前特征类型: {feature_type}")
 print("加载数据...")
 
-# 检查缓存文件是否存在
 if os.path.exists(cache_file):
     print(f"加载缓存数据: {cache_file}...")
     cache = np.load(cache_file)
     data = cache["data"]
     encoded_labels = cache["encoded_labels"]
 else:
-    # 如果缓存文件不存在，重新处理数据
     folder_path = hyperparameters["folder_path"]
-    data, encoded_labels = audio_to_cnn_data(folder_path, cache_file=cache_file)
+    data, encoded_labels = audio_to_cnn_data(
+        folder_path,
+        target_sr=22050,
+        n_mfcc=hyperparameters["n_mfcc"],
+        n_mels=hyperparameters["n_mels"],
+        max_length=hyperparameters["max_length"],
+        feature_type=feature_type,
+        cache_file=cache_file,
+    )
 
 # 转换为 Tensor
 data_tensor = torch.from_numpy(data).float()
@@ -69,11 +108,15 @@ train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 train_dataloader = DataLoader(train_dataset, batch_size=hyperparameters["batch_size"], shuffle=True)
 val_dataloader = DataLoader(val_dataset, batch_size=hyperparameters["batch_size"], shuffle=False)
 
-# 初始化模型、损失函数和优化器
-model = AudioCNN(num_classes=len(np.unique(encoded_labels))).to(device)
+input_channels = get_input_channels(
+    feature_type,
+    n_mfcc=hyperparameters["n_mfcc"],
+    n_mels=hyperparameters["n_mels"],
+)
+num_classes = len(np.unique(encoded_labels))
+model = AudioCNN(num_classes=num_classes, input_channels=input_channels).to(device)
 criterion = nn.CrossEntropyLoss()
 
-# 选择优化器
 if hyperparameters["optimizer"] == "Adam":
     optimizer = optim.Adam(model.parameters(), lr=hyperparameters["learning_rate"], weight_decay=hyperparameters["weight_decay"])
 elif hyperparameters["optimizer"] == "SGD":
@@ -87,82 +130,157 @@ else:
 
 scheduler = StepLR(optimizer, step_size=hyperparameters["step_size"], gamma=hyperparameters["gamma"])
 
-# 保存最佳模型
-best_val_accuracy = 0
-best_model_state = None
 
-# 用于存储训练输出的列表
+
+# =========================
+# 记录变量
+# =========================
+best_val_accuracy = 0
+best_val_recall = 0
+
 training_output = []
 
-# 训练模型
-num_epochs = hyperparameters["num_epochs"]
-for epoch in range(num_epochs):
+# 👉 新增（平均指标用）
+val_accuracy_list = []
+val_recall_list = []
+
+# =========================
+# Recall计算
+# =========================
+def compute_macro_recall(targets, predictions, num_classes):
+    recalls = []
+    targets = np.array(targets)
+    predictions = np.array(predictions)
+
+    for class_idx in range(num_classes):
+        mask = targets == class_idx
+        total = mask.sum()
+        if total == 0:
+            continue
+        tp = ((predictions == class_idx) & mask).sum()
+        recalls.append(tp / total)
+
+    return float(np.mean(recalls)) if recalls else 0.0
+
+
+# =========================
+# 训练循环
+# =========================
+for epoch in range(hyperparameters["num_epochs"]):
+
+    # ===== Train =====
     model.train()
-    train_running_loss = 0.0
+    train_loss = 0
     train_correct = 0
     train_total = 0
-    with tqdm(train_dataloader, unit="batch") as tepoch:
-        for batch_idx, (inputs, targets) in enumerate(tepoch):
+
+    with tqdm(train_dataloader) as pbar:
+        pbar.set_description(f"Epoch {epoch+1}/{hyperparameters['num_epochs']}")
+
+        for i, (inputs, targets) in enumerate(pbar):
             inputs, targets = inputs.to(device), targets.to(device)
+
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
 
-            train_running_loss += loss.item()
+            train_loss += loss.item()
+            _, pred = outputs.max(1)
 
-            _, predicted = outputs.max(1)
             train_total += targets.size(0)
-            train_correct += predicted.eq(targets).sum().item()
+            train_correct += pred.eq(targets).sum().item()
 
-            tepoch.set_postfix(loss=train_running_loss / (batch_idx + 1),
-                               train_accuracy=100. * train_correct / train_total)
+            pbar.set_postfix(
+                loss=train_loss/(i+1),
+                train_accuracy=100.*train_correct/train_total
+            )
 
-    # 验证模型
+    # ===== Validation =====
     model.eval()
-    val_running_loss = 0.0
+    val_loss = 0
     val_correct = 0
     val_total = 0
+
+    val_targets_all = []
+    val_preds_all = []
+
     with torch.no_grad():
         for inputs, targets in val_dataloader:
             inputs, targets = inputs.to(device), targets.to(device)
+
             outputs = model(inputs)
             loss = criterion(outputs, targets)
-            val_running_loss += loss.item()
 
-            _, predicted = outputs.max(1)
+            val_loss += loss.item()
+
+            _, pred = outputs.max(1)
             val_total += targets.size(0)
-            val_correct += predicted.eq(targets).sum().item()
+            val_correct += pred.eq(targets).sum().item()
 
-    val_accuracy = 100. * val_correct / val_total
-    train_loss = train_running_loss / len(train_dataloader)
-    train_accuracy = 100. * train_correct / train_total
-    val_loss = val_running_loss / len(val_dataloader)
+            val_targets_all.extend(targets.cpu().numpy())
+            val_preds_all.extend(pred.cpu().numpy())
 
-    print(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, '
-          f'Train Accuracy: {train_accuracy}%, '
-          f'Val Loss: {val_loss}, Val Accuracy: {val_accuracy}%')
+    val_accuracy = 100 * val_correct / val_total
+    val_recall = 100 * compute_macro_recall(val_targets_all, val_preds_all, num_classes)
 
-    # 保存当前轮次的训练输出
+    # 👉 新增记录
+    val_accuracy_list.append(val_accuracy)
+    val_recall_list.append(val_recall)
+
+    print(f"Train Acc: {100*train_correct/train_total:.2f}% | "
+          f"Val Acc: {val_accuracy:.2f}% | Val Recall: {val_recall:.2f}%")
+
     training_output.append({
-        "epoch": epoch + 1,
-        "train_loss": train_loss,
-        "train_accuracy": train_accuracy,
-        "val_loss": val_loss,
-        "val_accuracy": val_accuracy
+        "epoch": epoch+1,
+        "feature_type": feature_type,
+        "val_accuracy": val_accuracy,
+        "val_recall": val_recall
     })
 
-    # 更新学习率
     scheduler.step()
 
-    # 保存最佳模型
+    # ===== 保存最佳模型 =====
     if val_accuracy > best_val_accuracy:
         best_val_accuracy = val_accuracy
-        best_model_state = model.state_dict()
-        torch.save(best_model_state, 'best_model_test.pth')
-        print(f"Best model saved at epoch {epoch + 1} with validation accuracy: {val_accuracy}%")
+        best_val_recall = val_recall
 
-# 将训练输出保存到 JSON 文件
-with open('training_output.json', 'w') as f:
-    json.dump(training_output, f, indent=4)
+        torch.save(model.state_dict(), "best_model.pth")
+
+        save_feature_config("best_model_config.json", {
+            "feature_type": feature_type,
+            "target_sr": 22050,
+            "n_mfcc": hyperparameters["n_mfcc"],
+            "n_mels": hyperparameters["n_mels"],
+            "max_length": hyperparameters["max_length"],
+            "num_classes": num_classes,
+            "input_channels": input_channels,
+        })
+
+        print(f"✔ Best model saved (Acc={val_accuracy:.2f}%)")
+
+# =========================
+# 平均指标
+# =========================
+avg_val_accuracy = float(np.mean(val_accuracy_list))
+avg_val_recall = float(np.mean(val_recall_list))
+
+# =========================
+# 保存实验结果
+# =========================
+save_feature_config(f"experiment_metrics_{feature_type}.json", {
+    "feature_type": feature_type,
+    "best_val_accuracy": best_val_accuracy,
+    "best_val_recall": best_val_recall,
+    "avg_val_accuracy": avg_val_accuracy,
+    "avg_val_recall": avg_val_recall,
+})
+
+# =========================
+# 保存训练日志
+# =========================
+with open("training_output.json", "w", encoding="utf-8") as f:
+    json.dump(training_output, f, indent=4, ensure_ascii=False)
+
+print("训练完成 ✅")

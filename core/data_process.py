@@ -1,9 +1,39 @@
 import os
+
 import librosa
 import numpy as np
 from tqdm import tqdm
 
-def audio_to_cnn_data(folder_path, target_sr=22050, n_mfcc=13, max_length=1000, cache_file=None):
+from feature_utils import extract_audio_features
+
+"""
+本文件用于训练前的数据预处理与特征构建，将原始音频数据转换为 CNN 可用的输入格式。
+
+在原有基础上引入 feature_type、n_mfcc、n_mels、max_length 等参数，
+支持根据配置灵活选择 MFCC、Mel 或组合特征进行批量处理。
+
+特征提取统一调用 feature_utils 中的 extract_audio_features 函数，
+保证训练阶段与推理阶段使用完全一致的特征构造逻辑，避免不一致问题。
+
+同时扩展支持多种音频格式（.au、.wav、.mp3），增强数据兼容性。
+
+对输入音频文件路径进行排序处理，以保证数据处理顺序稳定，
+提高实验结果的可复现性。
+
+此外支持缓存机制，根据特征类型生成独立缓存文件，
+避免不同特征实验之间的数据混用，提高实验效率。
+"""
+
+
+def audio_to_cnn_data(
+    folder_path,
+    target_sr=22050,
+    n_mfcc=13,
+    n_mels=128,
+    max_length=1000,
+    feature_type="mfcc",
+    cache_file=None,
+):
     # 如果缓存文件存在，则直接加载缓存
     if cache_file and os.path.exists(cache_file):
         print(f"加载缓存数据: {cache_file}...")
@@ -15,26 +45,29 @@ def audio_to_cnn_data(folder_path, target_sr=22050, n_mfcc=13, max_length=1000, 
     au_files = []
     for root, dirs, files in os.walk(folder_path):
         for file in files:
-            if file.endswith('.au'):
+            if file.endswith('.au') or file.endswith('.wav') or file.endswith('.mp3'):
                 au_files.append(os.path.join(root, file))
 
     data = []
     labels = []
-    for file_path in tqdm(au_files, desc="Processing audio files"):
+    for file_path in tqdm(sorted(au_files), desc="Processing audio files"):
         try:
             audio, sr = librosa.load(file_path, sr=target_sr)
-            mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=n_mfcc)
-            if mfccs.shape[1] < max_length:
-                mfccs = np.pad(mfccs, ((0, 0), (0, max_length - mfccs.shape[1])), mode='constant')
-            else:
-                mfccs = mfccs[:, :max_length]
-            data.append(mfccs)
+            features = extract_audio_features(
+                audio,
+                sr,
+                feature_type=feature_type,
+                n_mfcc=n_mfcc,
+                n_mels=n_mels,
+                max_length=max_length,
+            )
+            data.append(features)
             label = os.path.basename(os.path.dirname(file_path))
             labels.append(label)
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
 
-    data = np.array(data)
+    data = np.array(data, dtype=np.float32)
     data = np.expand_dims(data, axis=-1)
     unique_labels = np.unique(labels)
     label_dict = {label: i for i, label in enumerate(unique_labels)}
