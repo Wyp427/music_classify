@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
-
+import json
 from data_process import audio_to_cnn_data
 from feature_utils import get_input_channels, save_feature_config
 from model_factory import build_model_from_config
@@ -299,6 +299,13 @@ for epoch in range(hyperparameters["num_epochs"]):
 
     training_output.append({
         "epoch": epoch + 1,
+        "model_type": model_type,
+        "feature_type": feature_type,
+        "fusion_type": hyperparameters["fusion_type"],
+        "standardize": hyperparameters["standardize"],
+        "train_loss": train_loss,
+        "train_accuracy": train_accuracy,
+        "val_loss": val_loss,
         "val_accuracy": val_accuracy,
         "val_recall": val_recall,
     })
@@ -313,6 +320,8 @@ for epoch in range(hyperparameters["num_epochs"]):
         torch.save(model.state_dict(), 'best_model.pth')
         save_feature_config('best_model_config.json', config_to_save)
         print(f"Best model saved at epoch {epoch + 1} with validation accuracy: {val_accuracy}%")
+
+
 
 
 # =========================
@@ -337,5 +346,13 @@ save_feature_config(
         "avg_val_recall": float(avg_val_recall),
     },
 )
+# =========================
+# 保存训练过程（给 report.py 用）
+# =========================
+with open("training_output.json", "w", encoding="utf-8") as f:
+    json.dump(training_output, f, indent=4, ensure_ascii=False)
+
+print("training_output.json 已保存")
+
 
 print("训练完成，指标已保存")
