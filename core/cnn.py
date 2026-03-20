@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 """
-本文件定义音频分类使用的卷积神经网络模型（AudioCNN）。
+本文件定义音频分类使用的卷积神经网络模型（AudioCNN）。 文件说明：
 
 主要改动是引入 input_channels 参数，使模型能够动态适配不同类型的音频特征输入，
 不再固定为传统 MFCC 的 13 维输入，从而支持 Mel（128维）以及 MFCC+Mel（141维）等多种特征形式。

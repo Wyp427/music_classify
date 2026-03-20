@@ -8,53 +8,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
 import streamlit as st
-import torch
 
-from cnn import AudioCNN
-from feature_utils import load_feature_config
 from label_mapper import GTZANLabelMapper
+from model_factory import load_model_and_config
 from pre_process import preprocess_and_predict
 
+#可视化代码文件
 
-"""
-本文件实现基于 Streamlit 的音频分类可视化界面。
-
-系统启动时自动加载 best_model_config.json，
-并根据配置构建模型与推理环境，保证与训练阶段一致。
-
-在界面侧边栏显示当前模型使用的特征类型，
-便于用户在实验过程中区分不同特征模型。
-
-用户上传音频后，调用统一推理接口 preprocess_and_predict，
-并使用配置中的特征参数进行特征提取与预测。
-
-预测结果中同时展示分类结果与当前特征类型，
-方便进行实验记录与结果对比。
-
-该模块实现了模型推理的可视化交互，支持快速验证不同特征方案效果。
-"""
-
-
-
-# 检查是否有可用的 GPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-config = load_feature_config("best_model_config.json")
-
-# 加载模型
-model = AudioCNN(
-    num_classes=config["num_classes"],
-    input_channels=config["input_channels"],
-)
-model.load_state_dict(torch.load('best_model.pth', map_location=device))
-model.to(device)
-model.eval()
+model, config, _ = load_model_and_config("best_model_config.json", "best_model.pth")
 
 with st.sidebar:
     st.title("菜单")
-    st.write(f"当前特征类型: {config['feature_type']}")
+    st.write(f"当前模型类型: {config.get('model_type', 'single')}")
+    st.write(f"当前特征类型: {config.get('feature_type', 'mfcc')}")
+    if config.get('model_type') == 'dual_branch':
+        st.write(f"融合方式: {config.get('fusion_type', 'concat')}")
     uploaded_file = st.file_uploader("上传音乐文件", type=["mp3", "wav", "ogg", "flac", "au"])
 
-st.markdown("<h2 style='text-align: center;'>音乐流派分类 BY CNN:ACC >=87.5%</h2>", unsafe_allow_html=True)
+st.markdown("<h2 style='text-align: center;'>音乐流派分类 BY CNN</h2>", unsafe_allow_html=True)
 
 json_data = None
 audio_data = None
@@ -77,8 +48,8 @@ if json_data is None:
         st.error("错误: 无法解析 'training_output.json' 文件的 JSON 内容。")
 
 
-def convert_au_to_wav_librosa(audio_data):
-    audio, sr = librosa.load(io.BytesIO(audio_data), sr=None)
+def convert_audio_to_wav(audio_bytes):
+    audio, sr = librosa.load(io.BytesIO(audio_bytes), sr=None)
     wav_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     sf.write(wav_file.name, audio, sr)
     return wav_file.name
@@ -121,8 +92,7 @@ if json_data is not None:
         if audio_data is not None:
             try:
                 audio_bytes = audio_data.read()
-                wav_file_path = convert_au_to_wav_librosa(audio_bytes)
-
+                wav_file_path = convert_audio_to_wav(audio_bytes)
                 audio, sr = librosa.load(wav_file_path)
                 mel_spec = librosa.feature.melspectrogram(y=audio, sr=sr)
                 mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
@@ -150,16 +120,16 @@ if json_data is not None:
                     n_mfcc=config["n_mfcc"],
                     n_mels=config["n_mels"],
                     max_length=config["max_length"],
-                    feature_type=config["feature_type"],
+                    feature_type=config.get("feature_type", "mfcc"),
+                    model_type=config.get("model_type", "single"),
+                    standardize=config.get("standardize", False),
                 )
-
                 if predicted_class is not None and probabilities is not None:
                     predicted_label = label_mapper.get_label(predicted_class)
-                    st.success(f"🎵 当前特征：**{config['feature_type']}**，预测音乐风格：**{predicted_label}**")
+                    st.success(f"🎵 模型：**{config.get('model_type', 'single')}**，预测音乐风格：**{predicted_label}**")
                     display_genre_probabilities(probabilities)
                 else:
                     st.error("预测时返回了无效结果。")
-
             except Exception as e:
                 st.error(f"预测时出现错误: {e}")
 
@@ -169,7 +139,6 @@ if json_data is not None:
             st.pyplot(train_loss_fig)
         with sub_col2:
             st.pyplot(train_accuracy_fig)
-
         sub_col3, sub_col4 = st.columns(2)
         with sub_col3:
             st.pyplot(val_loss_fig)
