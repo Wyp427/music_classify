@@ -18,6 +18,8 @@ target/
 *.logs
 *.log
 *.gz
+*.pth
+*.npz
 ### NetBeans ###
 nbproject/private/
 build/
