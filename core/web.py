@@ -3,15 +3,30 @@ import io
 import json
 import os
 import random
+import sys
+import tempfile
 from pathlib import Path
 
+import librosa
+import numpy as np
 import requests
-from flask import Flask, jsonify, request
+import soundfile as sf
+import torch
+from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, or_
+from transformers import AutoTokenizer
 from werkzeug.security import check_password_hash, generate_password_hash
 
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from feature_utils import extract_dual_branch_features
+from fusion_models import build_fusion_model
+from lyrics_data_process import compute_repetition_score
 from model_factory import load_model_and_config
 from pre_process import predict_lyrics, preprocess_and_predict_file
 
@@ -19,6 +34,7 @@ AUDIO_CONFIG_PATH = Path("best_model_config.json")
 AUDIO_MODEL_PATH = Path("best_model.pth")
 LYRICS_CONFIG_PATH = Path("lyrics_best_model_config.json")
 LYRICS_MODEL_PATH = Path("lyrics_best_model.pth")
+MULTIMODAL_MODEL_PATH = Path("multimodal_best_model_dynamic.pth")
 
 DEFAULT_DATABASE_URI = os.getenv(
     "DATABASE_URI",
@@ -122,11 +138,10 @@ def decode_base64_audio(audio_base64):
 def probabilities_to_response(probabilities):
     if probabilities is None:
         return {f"genre_{label}": 0.0 for label in GENRE_KEYS}
-
-    return {
-        f"genre_{GENRE_KEYS[i]}": float(probabilities[i])
-        for i in range(min(len(GENRE_KEYS), len(probabilities)))
-    }
+    response = {f"genre_{label}": 0.0 for label in GENRE_KEYS}
+    for i in range(min(len(GENRE_KEYS), len(probabilities))):
+        response[f"genre_{GENRE_KEYS[i]}"] = float(probabilities[i])
+    return response
 
 
 def get_training_metrics(config):
@@ -138,6 +153,70 @@ def get_training_metrics(config):
         return json.loads(file_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return []
+
+
+def netease_search_song(keyword, limit=10):
+    if not keyword:
+        return []
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}
+    search_url = "https://music.163.com/api/search/get"
+    lyric_url = "https://music.163.com/api/song/lyric"
+
+    try:
+        resp = requests.get(
+            search_url,
+            params={"s": keyword, "type": 1, "limit": limit},
+            headers=headers,
+            timeout=10,
+        )
+        payload = resp.json()
+    except Exception:
+        return []
+
+    songs = payload.get("result", {}).get("songs", []) or []
+    items = []
+    for song in songs:
+        song_id = song.get("id")
+        if not song_id:
+            continue
+
+        song_name = song.get("name", "")
+        artists = ",".join([a.get("name", "") for a in song.get("artists", []) if a.get("name")])
+        album_pic = (song.get("album") or {}).get("picUrl", "")
+        audio_url = f"http://music.163.com/song/media/outer/url?id={song_id}.mp3"
+        song_page = f"http://music.163.com/#/song?id={song_id}"
+        iframe_url = f"//music.163.com/outchain/player?type=2&id={song_id}&auto=0&height=66"
+
+        lyric_text = ""
+        try:
+            lr = requests.get(
+                lyric_url,
+                params={"id": song_id, "lv": -1, "tv": -1},
+                headers=headers,
+                timeout=8,
+            )
+            lyric_payload = lr.json()
+            lyric_text = (lyric_payload.get("lrc") or {}).get("lyric", "") or ""
+        except Exception:
+            lyric_text = ""
+
+        lyric_preview = (lyric_text.strip()[:180] + " ...") if lyric_text.strip() else "无歌词"
+
+        items.append(
+            {
+                "song_id": song_id,
+                "song_name": song_name,
+                "artists": artists,
+                "song_page": song_page,
+                "audio_url": audio_url,
+                "audio_proxy_url": f"/music_audio_proxy?id={song_id}",
+                "lyric_text": lyric_text,
+                "lyric_preview": lyric_preview,
+                "album_pic": album_pic,
+                "iframe_html": f'<iframe frameborder="no" border="0" marginwidth="0" marginheight="0" width="330" height="86" src="{iframe_url}"></iframe>',
+            }
+        )
+    return items
 
 
 def _music_to_dict(music):
@@ -168,6 +247,185 @@ def verify_password(stored_password, candidate_password):
     return check_password_hash(stored_password, candidate_password)
 
 
+def load_multimodal_fusion_head():
+    if (
+        AUDIO_BUNDLE["model"] is None
+        or LYRICS_BUNDLE["model"] is None
+        or not MULTIMODAL_MODEL_PATH.exists()
+    ):
+        return None
+
+    audio_model = AUDIO_BUNDLE["model"]
+    lyrics_model = LYRICS_BUNDLE["model"]
+    audio_dim = getattr(audio_model.classifier, "in_features", 128)
+    lyrics_dim = getattr(lyrics_model.classifier, "in_features", 256)
+    num_classes = getattr(audio_model.classifier, "out_features", 10)
+    fusion_head = build_fusion_model(
+        fusion="dynamic",
+        audio_dim=audio_dim,
+        lyrics_dim=lyrics_dim,
+        num_classes=num_classes,
+    )
+
+    checkpoint = torch.load(str(MULTIMODAL_MODEL_PATH), map_location="cpu")
+    if isinstance(checkpoint, dict) and "fusion" in checkpoint:
+        fusion_head.load_state_dict(checkpoint["fusion"])
+    else:
+        fusion_head.load_state_dict(checkpoint)
+
+    device = next(audio_model.parameters()).device
+    fusion_head.to(device)
+    fusion_head.eval()
+    return fusion_head
+
+
+MULTIMODAL_FUSION_HEAD = load_multimodal_fusion_head()
+TOKENIZER = None
+if LYRICS_BUNDLE["config"]:
+    try:
+        TOKENIZER = AutoTokenizer.from_pretrained(
+            LYRICS_BUNDLE["config"].get("pretrained_model_name", "bert-base-uncased")
+        )
+    except Exception:
+        TOKENIZER = None
+
+
+def convert_audio_to_wav(audio_bytes):
+    audio, sr = librosa.load(io.BytesIO(audio_bytes), sr=None)
+    wav_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    sf.write(wav_file.name, audio, sr)
+    return wav_file.name
+
+
+def _align_probabilities(probabilities, label_mapper, target_labels):
+    if len(probabilities) == len(target_labels):
+        return np.asarray(probabilities, dtype=np.float32)
+
+    aligned = np.zeros(len(target_labels), dtype=np.float32)
+    if label_mapper is not None:
+        source_labels = [str(x).lower() for x in label_mapper.get_labels()]
+    else:
+        source_labels = [str(i) for i in range(len(probabilities))]
+    target_map = {label.lower(): idx for idx, label in enumerate(target_labels)}
+
+    mapped = 0
+    for i, label in enumerate(source_labels[: len(probabilities)]):
+        if label in target_map:
+            aligned[target_map[label]] = probabilities[i]
+            mapped += 1
+    if mapped == 0:
+        aligned[: len(probabilities)] = probabilities
+    return aligned
+
+
+def predict_multimodal_from_bytes(audio_bytes, lyrics_text):
+    if (
+        AUDIO_BUNDLE["model"] is None
+        or LYRICS_BUNDLE["model"] is None
+        or MULTIMODAL_FUSION_HEAD is None
+        or TOKENIZER is None
+    ):
+        return None, None, None
+
+    wav_file_path = convert_audio_to_wav(audio_bytes)
+    try:
+        audio, sr = librosa.load(wav_file_path, sr=AUDIO_BUNDLE["config"].get("target_sr", 22050))
+        mfcc, mel = extract_dual_branch_features(
+            audio,
+            sr,
+            n_mfcc=AUDIO_BUNDLE["config"].get("n_mfcc", 13),
+            n_mels=AUDIO_BUNDLE["config"].get("n_mels", 128),
+            max_length=AUDIO_BUNDLE["config"].get("max_length", 1000),
+            standardize=AUDIO_BUNDLE["config"].get("standardize", True),
+        )
+
+        audio_model = AUDIO_BUNDLE["model"]
+        lyrics_model = LYRICS_BUNDLE["model"]
+        device = next(audio_model.parameters()).device
+
+        mfcc = torch.tensor(np.expand_dims(mfcc, axis=-1), dtype=torch.float32).unsqueeze(0).to(device)
+        mel = torch.tensor(np.expand_dims(mel, axis=-1), dtype=torch.float32).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            h_mfcc = audio_model.mfcc_branch(mfcc)
+            h_mel = audio_model.mel_branch(mel)
+            if audio_model.fusion_type == "concat":
+                fused = torch.cat([h_mfcc, h_mel], dim=1)
+            else:
+                gate = audio_model.gate(torch.cat([h_mfcc, h_mel], dim=1))
+                fused = gate * h_mfcc + (1 - gate) * h_mel
+
+            z_audio = torch.nn.functional.mish(audio_model.bn_fc1(audio_model.fusion_fc1(fused)))
+            audio_logits = audio_model.classifier(audio_model.dropout1(z_audio))
+            p_audio = torch.softmax(audio_logits, dim=1)
+
+            if lyrics_text.strip():
+                encoded = TOKENIZER(
+                    lyrics_text,
+                    max_length=LYRICS_BUNDLE["config"].get("max_length", 128),
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                input_ids = encoded["input_ids"].to(device)
+                attention_mask = encoded["attention_mask"].to(device)
+                repetition_score = torch.tensor(
+                    [compute_repetition_score(lyrics_text)],
+                    dtype=torch.float32,
+                    device=device,
+                )
+
+                outputs = lyrics_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    repetition_score=repetition_score,
+                )
+                cls_emb = outputs["cls_embedding"]
+                context_emb = outputs["context_embedding"]
+                gate = outputs["gate"]
+                z_lyrics = lyrics_model.fusion(torch.cat([cls_emb * gate[:, :1], context_emb * gate[:, 1:]], dim=1))
+                lyrics_logits = outputs["logits"]
+                p_lyrics = torch.softmax(lyrics_logits, dim=1)
+                has_lyrics = torch.ones((1, 1), dtype=torch.float32, device=device)
+            else:
+                z_lyrics = torch.zeros(
+                    (1, getattr(lyrics_model.classifier, "in_features", 256)),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                p_lyrics = torch.zeros_like(p_audio)
+                has_lyrics = torch.zeros((1, 1), dtype=torch.float32, device=device)
+
+            target_labels = (
+                AUDIO_BUNDLE["label_mapper"].get_labels()
+                if AUDIO_BUNDLE["label_mapper"] is not None
+                else [str(i) for i in range(p_audio.shape[1])]
+            )
+            pa = _align_probabilities(p_audio.squeeze(0).cpu().numpy(), AUDIO_BUNDLE["label_mapper"], target_labels)
+            pl = _align_probabilities(p_lyrics.squeeze(0).cpu().numpy(), LYRICS_BUNDLE["label_mapper"], target_labels)
+            p_audio = torch.tensor(pa, dtype=torch.float32, device=device).unsqueeze(0)
+            p_lyrics = torch.tensor(pl, dtype=torch.float32, device=device).unsqueeze(0)
+
+            fusion_outputs = MULTIMODAL_FUSION_HEAD(
+                z_audio,
+                z_lyrics,
+                p_audio,
+                p_lyrics,
+                has_lyrics=has_lyrics,
+            )
+            probs = fusion_outputs["probabilities"].squeeze(0).cpu().numpy()
+            pred_idx = int(np.argmax(probs))
+            pred_label = target_labels[pred_idx] if pred_idx < len(target_labels) else str(pred_idx)
+            weight = fusion_outputs.get("weights")
+            weight_value = float(weight.squeeze().item()) if weight is not None else None
+            return pred_label, probs, weight_value
+    finally:
+        try:
+            os.unlink(wav_file_path)
+        except OSError:
+            pass
+
+
 @app.route("/")
 def index():
     return """
@@ -175,226 +433,509 @@ def index():
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI音乐风格分类系统</title>
-
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
-<!-- ⭐ Three.js -->
-<script src="https://cdn.jsdelivr.net/npm/three@0.128/build/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128/examples/js/loaders/GLTFLoader.js"></script>
-
 <style>
-body{
-    margin:0;
-    font-family:"Segoe UI";
-    background:linear-gradient(135deg,#1e1e2f,#2a3a4f);
-    color:white;
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "Segoe UI", Arial, sans-serif;
+  color: #eaf2ff;
+  background: radial-gradient(circle at 20% 20%, #233a63, #121a2e 55%, #0d1424);
 }
-
-h1{text-align:center;}
-
-.container{
-    display:grid;
-    grid-template-columns:1fr 1fr 1fr;
-    gap:20px;
-    padding:20px;
+.top-nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  gap: 4px;
+  background: rgba(10, 18, 32, 0.95);
+  border-bottom: 1px solid rgba(255,255,255,0.15);
+  padding: 8px 10px;
 }
-
-.card{
-    background:rgba(255,255,255,0.08);
-    border-radius:15px;
-    padding:20px;
-    backdrop-filter:blur(10px);
-    box-shadow:0 0 15px rgba(0,0,0,0.3);
+.nav-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: #dbe9ff;
+  padding: 10px 14px;
 }
-
-button{
-    background:#00c3ff;
-    border:none;
-    padding:10px 15px;
-    border-radius:8px;
-    color:white;
-    cursor:pointer;
+.nav-btn.active {
+  background: rgba(61, 120, 255, 0.25);
+  border-color: rgba(97, 154, 255, 0.7);
 }
-
-textarea{
-    width:100%;
-    height:120px;
-    border-radius:8px;
+.page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 24px 16px 40px;
 }
-
-#assistantBox{
-    position:fixed;
-    bottom:20px;
-    right:20px;
-    width:350px;
-    height:450px;
+h1 {
+  margin: 0 0 8px 0;
+  text-align: center;
+  letter-spacing: 0.5px;
 }
-
-#assistantCanvas{
-    width:100%;
-    height:100%;
+.subtitle {
+  text-align: center;
+  color: #9cb3d4;
+  margin-bottom: 24px;
 }
-
-#assistantBubble{
-    position:absolute;
-    bottom:260px;
-    right:0;
-    background:#00c3ff;
-    padding:8px 12px;
-    border-radius:10px;
-    display:none;
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 16px;
+}
+.card {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 16px;
+  padding: 16px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+}
+.card h2 { margin: 0 0 12px; font-size: 20px; }
+.row { margin-bottom: 10px; }
+.row label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 13px;
+  color: #b7c9e7;
+}
+input, textarea {
+  width: 100%;
+  border: 1px solid #3b4e6e;
+  border-radius: 10px;
+  background: #10192b;
+  color: #eaf2ff;
+  padding: 10px;
+}
+textarea { min-height: 120px; resize: vertical; }
+button {
+  border: none;
+  border-radius: 10px;
+  background: linear-gradient(90deg, #2dd4ff, #3879ff);
+  color: #fff;
+  padding: 10px 14px;
+  cursor: pointer;
+  font-weight: 600;
+}
+button:hover { filter: brightness(1.08); }
+.result {
+  margin-top: 10px;
+  min-height: 24px;
+  color: #d6e6ff;
+}
+audio {
+  width: 100%;
+  margin-top: 8px;
+}
+.metrics {
+  margin-top: 8px;
+  font-size: 13px;
+  color: #9cc3ff;
+}
+.panel { display: none; }
+.panel.active { display: block; }
+.manager-layout {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  gap: 16px;
+}
+.manager-player-lyrics {
+  white-space: pre-wrap;
+  line-height: 1.6;
+  max-height: 460px;
+  overflow-y: auto;
+  background: #0f192c;
+  border: 1px solid #364b71;
+  border-radius: 10px;
+  padding: 10px;
+}
+.genre-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.genre-tab {
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid #4c648d;
+  background: #101b30;
+  color: #d8e7ff;
+  cursor: pointer;
+}
+.genre-tab.active {
+  background: #2d62c2;
+  border-color: #74a5ff;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th, td {
+  border-bottom: 1px solid rgba(255,255,255,0.12);
+  text-align: left;
+  padding: 8px 6px;
+  font-size: 14px;
+}
+.danger-btn {
+  background: linear-gradient(90deg, #ff6b6b, #d64545);
+}
+@media (max-width: 980px){
+  .manager-layout { grid-template-columns: 1fr; }
 }
 </style>
 </head>
-
 <body>
-
-<h1>🎵 AI音乐 / 歌词风格分类系统</h1>
-
-<div class="container">
-
-<div class="card">
-<h2>音乐上传</h2>
-<input id="songName" placeholder="歌曲名"><br>
-<input id="singerName" placeholder="歌手"><br>
-<input type="file" id="musicFile"><br>
-<button onclick="uploadMusic()">上传</button>
+<div class="top-nav">
+  <button id="tabClassifyBtn" class="nav-btn active" onclick="switchPanel('classify')">音乐风格分类</button>
+  <button id="tabSearchBtn" class="nav-btn" onclick="switchPanel('search')">音乐搜索</button>
+  <button id="tabManagerBtn" class="nav-btn" onclick="switchPanel('manager')">音乐管理</button>
 </div>
 
-<div class="card">
-<h2>播放器</h2>
-<audio id="audioPlayer" controls></audio>
-</div>
+<div class="page">
+  <section id="panelClassify" class="panel active">
+    <h1>🎵 AI 音乐风格分类系统</h1>
+    <p class="subtitle">音频分类 / 歌词分类 / 多模态融合分类（独立上传框）</p>
+    <div class="grid">
+      <section class="card">
+        <h2>音频分类</h2>
+        <div class="row"><label>音频文件（mp3/wav/ogg/flac/au）</label><input type="file" id="musicFile" accept=".mp3,.wav,.ogg,.flac,.au"></div>
+        <button onclick="uploadMusic()">上传并分类</button>
+        <div class="result" id="genreResult"></div>
+        <audio id="audioPlayer" controls></audio>
+        <canvas id="audioProbChart"></canvas>
+      </section>
 
-<div class="card">
-<h2>结果</h2>
-<p id="genreResult"></p>
-<canvas id="probChart"></canvas>
-</div>
+      <section class="card">
+        <h2>歌词分类</h2>
+        <div class="row"><label>歌词文本</label><textarea id="lyricsText" placeholder="在这里输入歌词"></textarea></div>
+        <div class="row"><label>或上传歌词文件（txt）</label><input type="file" id="lyricsFile" accept=".txt"></div>
+        <button onclick="predictLyrics()">歌词预测</button>
+        <div class="result" id="lyricsResult"></div>
+        <canvas id="lyricsProbChart"></canvas>
+      </section>
 
-</div>
+      <section class="card">
+        <h2>多模态分类（独立输入）</h2>
+        <div class="row"><label>多模态音频文件</label><input type="file" id="multimodalMusicFile" accept=".mp3,.wav,.ogg,.flac,.au"></div>
+        <div class="row"><label>多模态歌词文本</label><textarea id="multimodalLyricsText" placeholder="可选：输入歌词可提升融合效果"></textarea></div>
+        <div class="row"><label>或上传多模态歌词文件（txt）</label><input type="file" id="multimodalLyricsFile" accept=".txt"></div>
+        <button onclick="predictMultimodal()">多模态预测</button>
+        <div class="result" id="multimodalResult"></div>
+        <div class="metrics" id="fusionWeightText"></div>
+        <audio id="multimodalAudioPlayer" controls></audio>
+        <canvas id="multimodalProbChart"></canvas>
+      </section>
+    </div>
+  </section>
 
-<hr>
+  <section id="panelSearch" class="panel">
+    <h1>🔎 音乐搜索器</h1>
+    <p class="subtitle">输入歌名进行搜索，返回歌曲信息、音频链接、歌词与可播放外链播放器。</p>
+    <section class="card">
+      <div class="row"><label>歌曲关键词</label><input id="searchKeyword" placeholder="例如：The Thrill Is Gone B.B. King"></div>
+      <button onclick="searchMusicNow()">搜索</button>
+      <div class="result" id="searchStatus"></div>
+      <div id="searchResults" style="margin-top:12px;"></div>
+    </section>
+  </section>
 
-<div class="container">
-
-<div class="card">
-<h2>歌词分类</h2>
-
-<textarea id="lyricsText"></textarea><br>
-
-<input type="file" id="lyricsFile" accept=".txt"><br>
-
-<button onclick="predictLyrics()">预测</button>
-
-<p id="lyricsResult"></p>
-</div>
-
-</div>
-
-<!-- ⭐ 3D人物 -->
-<div id="assistantBox">
-    <canvas id="assistantCanvas"></canvas>
-    <div id="assistantBubble">你好 🤖</div>
+  <section id="panelManager" class="panel">
+    <h1>🎼 音乐管理</h1>
+    <p class="subtitle">管理你的歌曲库：按分类查看、添加、播放、删除，并在播放器中同步显示歌词。</p>
+    <div class="manager-layout">
+      <section class="card">
+        <h2>音乐播放器</h2>
+        <div class="result" id="managerNowPlaying">当前未播放</div>
+        <audio id="managerAudioPlayer" controls></audio>
+        <h3>歌词</h3>
+        <div id="managerLyricsDisplay" class="manager-player-lyrics">请选择右侧歌曲进行播放，歌词会显示在这里。</div>
+      </section>
+      <section class="card">
+        <h2>音乐库</h2>
+        <div id="managerGenreTabs" class="genre-tabs"></div>
+        <table>
+          <thead>
+            <tr><th>歌名</th><th>分类</th><th>操作</th></tr>
+          </thead>
+          <tbody id="managerSongTable"></tbody>
+        </table>
+        <hr style="border-color: rgba(255,255,255,0.18)">
+        <h3>添加音乐</h3>
+        <div class="row"><label>歌名</label><input id="manageSongName" placeholder="输入歌名"></div>
+        <div class="row"><label>分类</label><select id="manageGenreSelect"></select></div>
+        <div class="row"><label>音频文件</label><input id="manageAudioFile" type="file" accept=".mp3,.wav,.ogg,.flac,.au"></div>
+        <div class="row"><label>歌词文本</label><textarea id="manageLyricsText" placeholder="可直接输入歌词"></textarea></div>
+        <div class="row"><label>或上传歌词文件（txt/lrc）</label><input id="manageLyricsFile" type="file" accept=".txt,.lrc"></div>
+        <button onclick="addManagedSong()">添加音乐</button>
+      </section>
+    </div>
+  </section>
 </div>
 
 <script>
+const labels = ["blues","classical","country","disco","hiphop","jazz","metal","pop","reggae","rock"]
+let audioChart = null
+let lyricsChart = null
+let multimodalChart = null
+let managerSelectedGenre = labels[0]
+const managedSongs = []
 
-let chart=null
-let uploadedLyricsText=""
-
-const labels=["blues","classical","country","disco","hiphop","jazz","metal","pop","reggae","rock"]
-
-// ===== 歌词上传 =====
-document.getElementById("lyricsFile").addEventListener("change",function(){
-
-let file=this.files[0]
-
-let reader=new FileReader()
-
-reader.onload=function(e){
-uploadedLyricsText=e.target.result
-document.getElementById("lyricsText").value=uploadedLyricsText
+function readTextFile(file){
+  return new Promise((resolve,reject)=>{
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result || "")
+    reader.onerror = reject
+    reader.readAsText(file)
+  })
 }
 
-reader.readAsText(file)
+function base64FromFile(file){
+  return new Promise((resolve,reject)=>{
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result)
+    reader.onerror = reject
+    reader.readAsDataURL(file)
+  })
+}
+
+function switchPanel(panel){
+  const classifyPanel = document.getElementById("panelClassify")
+  const searchPanel = document.getElementById("panelSearch")
+  const managerPanel = document.getElementById("panelManager")
+  const classifyBtn = document.getElementById("tabClassifyBtn")
+  const searchBtn = document.getElementById("tabSearchBtn")
+  const managerBtn = document.getElementById("tabManagerBtn")
+  classifyPanel.classList.remove("active")
+  searchPanel.classList.remove("active")
+  managerPanel.classList.remove("active")
+  classifyBtn.classList.remove("active")
+  searchBtn.classList.remove("active")
+  managerBtn.classList.remove("active")
+  if(panel === "manager"){
+    managerPanel.classList.add("active")
+    managerBtn.classList.add("active")
+  }else if(panel === "search"){
+    searchPanel.classList.add("active")
+    searchBtn.classList.add("active")
+  }else{
+    classifyPanel.classList.add("active")
+    classifyBtn.classList.add("active")
+  }
+}
+
+async function searchMusicNow(){
+  const keyword = (document.getElementById("searchKeyword").value || "").trim()
+  if (!keyword){ alert("请输入歌曲关键词"); return }
+  document.getElementById("searchStatus").innerText = "搜索中..."
+  const resp = await fetch(`/music_search_api?keyword=${encodeURIComponent(keyword)}`)
+  const data = await resp.json()
+  if (!resp.ok){
+    document.getElementById("searchStatus").innerText = data.message || "搜索失败"
+    return
+  }
+  const items = data.results || []
+  document.getElementById("searchStatus").innerText = `搜索完成，共 ${items.length} 条结果`
+  const wrap = document.getElementById("searchResults")
+  if (!items.length){
+    wrap.innerHTML = "<div class='result'>未找到相关歌曲</div>"
+    return
+  }
+  wrap.innerHTML = items.map((item, idx) => `
+    <div class="card" style="margin-bottom:12px;">
+      <div><strong>${idx + 1}. ${item.song_name || ""}</strong> - ${item.artists || ""}</div>
+      <div class="metrics">Song ID: ${item.song_id || ""}</div>
+      <div class="metrics"><a href="${item.song_page}" target="_blank" style="color:#8fc2ff;">歌曲页面链接</a></div>
+      <div class="metrics"><a href="${item.audio_url}" target="_blank" style="color:#8fc2ff;">音频链接</a></div>
+      <div class="metrics">歌词预览：${item.lyric_preview || "无歌词"}</div>
+      <audio controls style="width:330px; margin-top:8px;" src="${item.audio_proxy_url || ""}"></audio>
+      <div style="margin-top:8px;">${item.iframe_html || ""}</div>
+    </div>
+  `).join("")
+}
+
+function renderChart(canvasId, probabilities, chartType){
+  const values = labels.map(x => Number(probabilities["genre_" + x] || 0))
+  if (chartType === "audio" && audioChart){ audioChart.destroy() }
+  if (chartType === "lyrics" && lyricsChart){ lyricsChart.destroy() }
+  if (chartType === "multimodal" && multimodalChart){ multimodalChart.destroy() }
+  const chart = new Chart(document.getElementById(canvasId), {
+    type: "bar",
+    data: { labels, datasets: [{ label: "概率", data: values }] },
+    options: { scales: { y: { beginAtZero: true, max: 1 } } }
+  })
+  if (chartType === "audio"){ audioChart = chart }
+  if (chartType === "lyrics"){ lyricsChart = chart }
+  if (chartType === "multimodal"){ multimodalChart = chart }
+}
+
+document.getElementById("lyricsFile").addEventListener("change", async (e) => {
+  const file = e.target.files[0]
+  if (!file) return
+  document.getElementById("lyricsText").value = await readTextFile(file)
 })
 
-// ===== 3D人物 =====
-const scene = new THREE.Scene()
-
-const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000)
-
-const renderer = new THREE.WebGLRenderer({
-canvas: document.getElementById("assistantCanvas"),
-alpha: true
+document.getElementById("multimodalLyricsFile").addEventListener("change", async (e) => {
+  const file = e.target.files[0]
+  if (!file) return
+  document.getElementById("multimodalLyricsText").value = await readTextFile(file)
 })
 
-renderer.setSize(220,260)
+document.getElementById("manageLyricsFile").addEventListener("change", async (e) => {
+  const file = e.target.files[0]
+  if (!file) return
+  document.getElementById("manageLyricsText").value = await readTextFile(file)
+})
 
-const light = new THREE.HemisphereLight(0xffffff, 0x444444)
-scene.add(light)
-camera.position.set(0, 1.2, 6)      //  ④ 改相机
-
-let mixer
-
-//  加载自己的模型 
-const loader = new THREE.GLTFLoader()
-
-loader.load(
-    "/static/free_cure_girl.glb",     //  ① 改路径
-
-    function (gltf) {
-
-        const model = gltf.scene
-
-        //  根据模型调整
-        model.scale.set(5.5,5.5,5.5)      //  ② 改大小
-        model.position.x = 0
-        model.position.y = -0.3     //  ③ 改位置
-        scene.add(model)
-
-        // 动画
-        if (gltf.animations.length > 0) {
-            mixer = new THREE.AnimationMixer(model)
-            const action = mixer.clipAction(gltf.animations[0])
-            action.play()
-        }
-    },
-
-    undefined,
-
-    function (error) {
-        console.error("模型加载失败:", error)
-    }
-)
-
-const clock = new THREE.Clock()
-
-function animate() {
-    requestAnimationFrame(animate)
-
-    if (mixer) {
-        mixer.update(clock.getDelta())
-    }
-
-    renderer.render(scene, camera)
+async function uploadMusic(){
+  const file = document.getElementById("musicFile").files[0]
+  if (!file){ alert("请先选择音频文件"); return }
+  const b64 = await base64FromFile(file)
+  const payload = {
+    songName: "未命名歌曲",
+    singerName: "未知歌手",
+    userId: 1,
+    musicFile: b64
+  }
+  const resp = await fetch("/upload_music", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  })
+  const data = await resp.json()
+  if (!resp.ok){ alert(data.message || "上传失败"); return }
+  document.getElementById("genreResult").innerText = `音频预测风格：${data.genre}`
+  document.getElementById("audioPlayer").src = b64
+  renderChart("audioProbChart", data.probabilities || {}, "audio")
 }
 
-animate()
-
-// 点击交互
-const bubble=document.getElementById("assistantBubble")
-
-document.getElementById("assistantCanvas").onclick=()=>{
-bubble.style.display="block"
-bubble.innerText="🎵 欢迎使用AI音乐系统"
-setTimeout(()=>bubble.style.display="none",2000)
+async function predictLyrics(){
+  const lyricsText = (document.getElementById("lyricsText").value || "").trim()
+  if (!lyricsText){ alert("请输入歌词文本"); return }
+  const resp = await fetch("/predict_lyrics", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lyrics_text: lyricsText })
+  })
+  const data = await resp.json()
+  if (!resp.ok){ alert(data.message || "歌词预测失败"); return }
+  document.getElementById("lyricsResult").innerText = `歌词预测风格：${data.genre}`
+  renderChart("lyricsProbChart", data.probabilities || {}, "lyrics")
 }
 
+async function predictMultimodal(){
+  const file = document.getElementById("multimodalMusicFile").files[0]
+  if (!file){ alert("请先选择多模态音频文件"); return }
+  const b64 = await base64FromFile(file)
+  const lyricsText = (document.getElementById("multimodalLyricsText").value || "").trim()
+  const resp = await fetch("/predict_multimodal", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ musicFile: b64, lyrics_text: lyricsText })
+  })
+  const data = await resp.json()
+  if (!resp.ok){ alert(data.message || "多模态预测失败"); return }
+  document.getElementById("multimodalAudioPlayer").src = b64
+  document.getElementById("multimodalResult").innerText = `多模态预测风格：${data.genre}`
+  document.getElementById("fusionWeightText").innerText =
+    data.fusion_weight === null || data.fusion_weight === undefined
+    ? ""
+    : `融合权重：${Number(data.fusion_weight).toFixed(4)}`
+  renderChart("multimodalProbChart", data.probabilities || {}, "multimodal")
+}
+
+function renderManagerGenreTabs(){
+  const wrap = document.getElementById("managerGenreTabs")
+  wrap.innerHTML = ""
+  labels.forEach((genre) => {
+    const btn = document.createElement("button")
+    btn.className = "genre-tab" + (managerSelectedGenre === genre ? " active" : "")
+    btn.textContent = genre
+    btn.onclick = () => {
+      managerSelectedGenre = genre
+      renderManagerGenreTabs()
+      renderManagerSongTable()
+    }
+    wrap.appendChild(btn)
+  })
+}
+
+function renderManageGenreSelect(){
+  const select = document.getElementById("manageGenreSelect")
+  select.innerHTML = labels.map((genre) => `<option value="${genre}">${genre}</option>`).join("")
+}
+
+function renderManagerSongTable(){
+  const tbody = document.getElementById("managerSongTable")
+  const songs = managedSongs.filter((x) => x.genre === managerSelectedGenre)
+  if (songs.length === 0){
+    tbody.innerHTML = `<tr><td colspan="3">当前分类暂无歌曲</td></tr>`
+    return
+  }
+  tbody.innerHTML = songs.map((song) => `
+    <tr>
+      <td>${song.name}</td>
+      <td>${song.genre}</td>
+      <td>
+        <button onclick="playManagedSong('${song.id}')">播放</button>
+        <button class="danger-btn" onclick="deleteManagedSong('${song.id}')">删除</button>
+      </td>
+    </tr>
+  `).join("")
+}
+
+function playManagedSong(songId){
+  const song = managedSongs.find((x) => x.id === songId)
+  if (!song) return
+  document.getElementById("managerNowPlaying").innerText = `正在播放：${song.name} (${song.genre})`
+  document.getElementById("managerLyricsDisplay").innerText = song.lyrics || "暂无歌词"
+  const audio = document.getElementById("managerAudioPlayer")
+  audio.src = song.audioUrl
+  audio.play()
+}
+
+function deleteManagedSong(songId){
+  const idx = managedSongs.findIndex((x) => x.id === songId)
+  if (idx >= 0){
+    const removed = managedSongs[idx]
+    if (removed.audioUrl){
+      URL.revokeObjectURL(removed.audioUrl)
+    }
+    managedSongs.splice(idx, 1)
+  }
+  renderManagerSongTable()
+}
+
+async function addManagedSong(){
+  const name = (document.getElementById("manageSongName").value || "").trim()
+  const genre = document.getElementById("manageGenreSelect").value
+  const audioFile = document.getElementById("manageAudioFile").files[0]
+  const lyrics = (document.getElementById("manageLyricsText").value || "").trim()
+  if (!name){ alert("请填写歌名"); return }
+  if (!audioFile){ alert("请上传音频文件"); return }
+
+  const audioUrl = URL.createObjectURL(audioFile)
+  managedSongs.push({
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    name,
+    genre,
+    lyrics,
+    audioUrl,
+  })
+  document.getElementById("manageSongName").value = ""
+  document.getElementById("manageAudioFile").value = ""
+  document.getElementById("manageLyricsText").value = ""
+  document.getElementById("manageLyricsFile").value = ""
+  managerSelectedGenre = genre
+  renderManagerGenreTabs()
+  renderManagerSongTable()
+  alert("添加成功")
+}
+
+renderManageGenreSelect()
+renderManagerGenreTabs()
+renderManagerSongTable()
 </script>
-
 </body>
 </html>
 """
@@ -512,6 +1053,30 @@ def upload_music():
         return jsonify({"message": f"上传失败: {str(e)}"}), 500
 
 
+@app.route("/predict_multimodal", methods=["POST"])
+def predict_multimodal_api():
+    data = request.get_json(silent=True) or {}
+    music_base64 = data.get("musicFile")
+    lyrics_text = (data.get("lyrics_text") or "").strip()
+
+    if not music_base64:
+        return jsonify({"message": "未收到音乐文件"}), 400
+
+    try:
+        music_binary = decode_base64_audio(music_base64)
+        predicted_label, probabilities, fusion_weight = predict_multimodal_from_bytes(music_binary, lyrics_text)
+        if predicted_label is None or probabilities is None:
+            return jsonify({"message": "多模态模型尚未训练或模型文件不存在"}), 404
+        return jsonify({
+            "task_type": "multimodal",
+            "genre": predicted_label,
+            "probabilities": probabilities_to_response(probabilities),
+            "fusion_weight": fusion_weight,
+        })
+    except Exception as e:
+        return jsonify({"message": f"多模态预测失败: {str(e)}"}), 500
+
+
 @app.route("/search_music", methods=["GET"])
 def search_music():
     query = request.args.get("query", "").strip()
@@ -527,6 +1092,35 @@ def search_music():
         musics = Music.query.order_by(func.random()).limit(24).all()
 
     return jsonify([_music_to_dict(music) for music in musics])
+
+
+@app.route("/music_search_api", methods=["GET"])
+def music_search_api():
+    keyword = request.args.get("keyword", "").strip()
+    if not keyword:
+        return jsonify({"message": "请提供 keyword 参数", "results": []}), 400
+    results = netease_search_song(keyword, limit=10)
+    return jsonify({"keyword": keyword, "results": results})
+
+
+@app.route("/music_audio_proxy", methods=["GET"])
+def music_audio_proxy():
+    song_id = request.args.get("id", "").strip()
+    if not song_id:
+        return jsonify({"message": "缺少 id 参数"}), 400
+
+    url = f"http://music.163.com/song/media/outer/url?id={song_id}.mp3"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}
+    try:
+        upstream = requests.get(url, headers=headers, stream=True, timeout=15, allow_redirects=True)
+    except Exception as e:
+        return jsonify({"message": f"音频代理失败: {str(e)}"}), 502
+
+    if upstream.status_code != 200:
+        return jsonify({"message": f"上游返回状态码: {upstream.status_code}"}), 502
+
+    content_type = upstream.headers.get("Content-Type", "audio/mpeg")
+    return Response(upstream.iter_content(chunk_size=8192), content_type=content_type)
 
 
 @app.route("/is_favorited", methods=["GET"])

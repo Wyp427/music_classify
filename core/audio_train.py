@@ -33,7 +33,7 @@ hyperparameters = {
 
     # ===== 训练 =====
     "batch_size": 16,
-    "learning_rate":5e-7,   #选择不同学习率进行消融实验
+    "learning_rate":5e-5,   #选择不同学习率进行消融实验
     "num_epochs": 20,
 
     # ===== 优化 =====
@@ -83,6 +83,38 @@ def compute_macro_f1(targets, predictions, num_classes):
         f1 = 2 * p * r / (p + r + 1e-8)
         f1s.append(f1)
     return np.mean(f1s)
+
+
+def compute_classification_metrics(targets, predictions, label_names):
+    targets = np.array(targets)
+    predictions = np.array(predictions)
+    num_classes = len(label_names)
+
+    genre_f1 = {}
+    precisions = []
+    recalls = []
+    f1s = []
+
+    for c, label in enumerate(label_names):
+        tp = ((predictions == c) & (targets == c)).sum()
+        fp = ((predictions == c) & (targets != c)).sum()
+        fn = ((predictions != c) & (targets == c)).sum()
+
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+        precisions.append(float(precision))
+        recalls.append(float(recall))
+        f1s.append(float(f1))
+        genre_f1[label] = float(f1)
+
+    return {
+        "genre_f1": genre_f1,
+        "macro_precision": float(np.mean(precisions)),
+        "macro_recall": float(np.mean(recalls)),
+        "macro_f1": float(np.mean(f1s)),
+    }
 
 
 # =========================
@@ -150,6 +182,18 @@ else:
     raise NotImplementedError("当前只保留 dual_branch 版本")
 
 num_classes = len(np.unique(encoded_labels))
+label_names = [
+    "blues",
+    "classical",
+    "country",
+    "disco",
+    "hiphop",
+    "jazz",
+    "metal",
+    "pop",
+    "reggae",
+    "rock",
+]
 
 
 # =========================
@@ -301,7 +345,15 @@ for fold, (train_idx, test_idx) in enumerate(kf.split(dataset)):
 
     print(f"Fold {fold+1} Test Acc {test_acc:.2f}% | F1 {test_f1:.2f}%")
 
-    fold_results.append((test_acc, test_f1))
+    fold_metrics = compute_classification_metrics(test_targets, test_preds, label_names)
+    fold_results.append({
+        "accuracy": float(test_acc),
+        "f1": float(test_f1),
+        "genre_f1": fold_metrics["genre_f1"],
+        "macro_precision": fold_metrics["macro_precision"],
+        "macro_recall": fold_metrics["macro_recall"],
+        "macro_f1": fold_metrics["macro_f1"],
+    })
 
     # 修复JSON
     with open("test_predictions.json", "w") as f:
@@ -323,18 +375,35 @@ print("training_output.json 已保存")
 # 保存 test 结果
 # =========================
 with open("test_results.json", "w") as f:
-    json.dump({
-        "test_accs": [float(x[0]) for x in fold_results],
-        "test_f1s": [float(x[1]) for x in fold_results]
-    }, f)
+    final_genre_f1 = {
+        name: float(np.mean([fold["genre_f1"][name] for fold in fold_results]))
+        for name in label_names
+    }
+    macro_precision = float(np.mean([fold["macro_precision"] for fold in fold_results]))
+    macro_recall = float(np.mean([fold["macro_recall"] for fold in fold_results]))
+    macro_f1 = float(np.mean([fold["macro_f1"] for fold in fold_results]))
+    payload = {
+        "test_accs": [fold["accuracy"] for fold in fold_results],
+        "test_f1s": [fold["f1"] for fold in fold_results],
+        "genre_f1": final_genre_f1,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1,
+        "table_row": {
+            "Fusion Method": hyperparameters["fusion_type"].capitalize(),
+            **{name.capitalize(): final_genre_f1[name] for name in label_names},
+            "Macro avg": macro_f1,
+        },
+    }
+    json.dump(payload, f, indent=4, ensure_ascii=False)
 
 print("test_results.json 已保存")
 
 # =========================
 # 保存最终指标
 # =========================
-accs = [x[0] for x in fold_results]
-f1s = [x[1] for x in fold_results]
+accs = [x["accuracy"] for x in fold_results]
+f1s = [x["f1"] for x in fold_results]
 
 save_feature_config(
     f"experiment_metrics_{experiment_name}.json",

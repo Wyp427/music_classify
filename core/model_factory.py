@@ -93,7 +93,18 @@ def load_model_and_config(config_path="best_model_config.json", model_path="best
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model_from_config(config)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.to(device)
+
+    # 建议先在CPU加载权重，再搬运
+    state_dict = torch.load(model_path, map_location="cpu")
+
+    # 关键：兼容 meta tensor
+    has_meta = any(p.is_meta for p in model.parameters())
+    if has_meta:
+        model.to_empty(device=device)
+        model.load_state_dict(state_dict, strict=True, assign=True)
+    else:
+        model.load_state_dict(state_dict, strict=True)
+        model.to(device)
+
     model.eval()
     return model, config, device, label_mapper

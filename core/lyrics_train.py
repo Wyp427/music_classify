@@ -21,7 +21,7 @@ config = {
     "max_length": 128,
     "batch_size": 4,
 
-    "learning_rate": 5e-7,   #
+    "learning_rate": 5e-4,   #
     "num_epochs": 20,
 
     "dropout": 0.3,
@@ -116,6 +116,37 @@ def compute_macro_f1(targets, preds, num_classes):
         f1s.append(f1)
 
     return float(np.mean(f1s))
+
+
+def compute_classification_metrics(targets, preds, label_names):
+    targets = np.array(targets)
+    preds = np.array(preds)
+
+    genre_f1 = {}
+    precisions = []
+    recalls = []
+    f1s = []
+
+    for c, label in enumerate(label_names):
+        tp = ((preds == c) & (targets == c)).sum()
+        fp = ((preds == c) & (targets != c)).sum()
+        fn = ((preds != c) & (targets == c)).sum()
+
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+        precisions.append(float(precision))
+        recalls.append(float(recall))
+        f1s.append(float(f1))
+        genre_f1[label] = float(f1)
+
+    return {
+        "genre_f1": genre_f1,
+        "macro_precision": float(np.mean(precisions)),
+        "macro_recall": float(np.mean(recalls)),
+        "macro_f1": float(np.mean(f1s)),
+    }
 
 
 # =========================
@@ -308,7 +339,15 @@ for fold, (train_idx, test_idx) in enumerate(kf.split(dataset["texts"])):
 
     print(f"Fold {fold+1} Test Acc {test_acc:.2f}% | F1 {test_f1:.2f}%")
 
-    fold_results.append((test_acc, test_f1))
+    fold_metrics = compute_classification_metrics(test_targets, test_preds, dataset["label_names"])
+    fold_results.append({
+        "accuracy": float(test_acc),
+        "f1": float(test_f1),
+        "genre_f1": fold_metrics["genre_f1"],
+        "macro_precision": fold_metrics["macro_precision"],
+        "macro_recall": fold_metrics["macro_recall"],
+        "macro_f1": fold_metrics["macro_f1"],
+    })
 
 
 # =========================
@@ -318,10 +357,28 @@ with open("lyrics_training_output.json", "w", encoding="utf-8") as f:
     json.dump(training_output, f, indent=4)
 
 with open("lyrics_test_results.json", "w") as f:
-    json.dump({
-        "test_accs": [float(x[0]) for x in fold_results],
-        "test_f1s": [float(x[1]) for x in fold_results]
-    }, f)
+    final_genre_f1 = {
+        name: float(np.mean([fold["genre_f1"][name] for fold in fold_results]))
+        for name in dataset["label_names"]
+    }
+    macro_precision = float(np.mean([fold["macro_precision"] for fold in fold_results]))
+    macro_recall = float(np.mean([fold["macro_recall"] for fold in fold_results]))
+    macro_f1 = float(np.mean([fold["macro_f1"] for fold in fold_results]))
+
+    payload = {
+        "test_accs": [fold["accuracy"] for fold in fold_results],
+        "test_f1s": [fold["f1"] for fold in fold_results],
+        "genre_f1": final_genre_f1,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1,
+        "table_row": {
+            "Fusion Method": "Lyrics",
+            **{name.capitalize(): final_genre_f1[name] for name in dataset["label_names"]},
+            "Macro avg": macro_f1,
+        },
+    }
+    json.dump(payload, f, indent=4, ensure_ascii=False)
 
 with open("lyrics_test_predictions.json", "w") as f:
     json.dump({
